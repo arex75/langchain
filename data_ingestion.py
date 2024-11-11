@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 def format_github_feed(event_type, payload):
     """Format GitHub webhook payload into a feed based on event type"""
+    # Your existing format_github_feed function remains the same
     base_feed = {
         "event_type": event_type,
         "repository": {
@@ -34,7 +35,6 @@ def format_github_feed(event_type, payload):
         "timestamp": None
     }
 
-    # Rest of your format_github_feed function remains the same
     if event_type == 'push':
         commit = payload.get('head_commit', {})
         base_feed.update({
@@ -109,7 +109,6 @@ class RabbitMQService:
         self.password = password
         self.queue_name = queue_name
         self._connect()
-        logger.info("RabbitMQ connection established")
 
     def _connect(self):
         try:
@@ -141,7 +140,7 @@ class RabbitMQService:
             self._connect()
             self.channel.queue_declare(queue=queue_name, durable=True)
 
-    def publish_message(self, message, queue_name=None):
+    def publish_message(self, message, queue_name=None):  # Changed from publish to publish_message
         try:
             queue_name = queue_name or self.queue_name
 
@@ -167,7 +166,7 @@ class RabbitMQService:
             logger.error(f"Failed to publish message: {str(e)}")
             return False
 
-    def close(self):
+    def close(self):  # Changed from close_connection to close
         if self.connection and not self.connection.is_closed:
             self.connection.close()
             logger.info("RabbitMQ connection closed")
@@ -175,7 +174,7 @@ class RabbitMQService:
 
 app = Flask(__name__)
 
-# Initialize RabbitMQ service with your configuration
+# Initialize RabbitMQ service
 rabbitmq_service = RabbitMQService(
     host=os.getenv('RABBITMQ_HOST', '86b9cd9e-2f65-45b4-86c5-b4f6f5b87512.hsvc.ir'),
     port=int(os.getenv('RABBITMQ_PORT', 30379)),
@@ -205,7 +204,7 @@ def webhook():
         formatted_message = format_github_feed(event_type, payload)
         logger.info(f"Formatted message: {json.dumps(formatted_message, indent=2)}")
 
-        # Publish formatted message to RabbitMQ
+        # Use publish_message instead of publish
         success = rabbitmq_service.publish_message(formatted_message)
 
         if success:
@@ -229,7 +228,7 @@ def webhook():
 
 @app.teardown_appcontext
 def cleanup(exception=None):
-    rabbitmq_service.close()
+    rabbitmq_service.close()  # Changed from close_connection to close
 
 
 if __name__ == '__main__':
