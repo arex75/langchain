@@ -1,0 +1,10 @@
+langchain-core
+langchain-community
+langchain
+pydantic
+openai
+elasticsearch
+python-dotenv
+aio-pika
+psycopg2-binary
+tiktoken
