@@ -11,13 +11,13 @@ import sys
 # Load environment variables
 load_dotenv()
 
-# Enhanced logging setup
+# Set up logging with more detailed format
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG level
+    level=logging.DEBUG,  # Changed to DEBUG level
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.FileHandler('webhook.log'),
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler()  # Add console output
     ]
 )
 logger = logging.getLogger(__name__)
@@ -144,27 +144,50 @@ class RabbitMQService:
 app = Flask(__name__)
 
 
-# Log all requests
+# Add logging for ALL requests
 @app.before_request
-def log_request():
-    logger.info(f"Received {request.method} request to {request.url}")
-    logger.debug(f"Headers: {dict(request.headers)}")
+def log_request_info():
+    """Log details about every request"""
+    logger.debug("------- New Request -------")
+    logger.debug(f"Request Method: {request.method}")
+    logger.debug(f"Request URL: {request.url}")
+    logger.debug(f"Request Headers: {dict(request.headers)}")
     if request.data:
-        logger.debug(f"Request data: {request.get_data(as_text=True)}")
+        logger.debug(f"Request Data: {request.get_data(as_text=True)}")
+
+
+@app.after_request
+def log_response_info(response):
+    """Log details about every response"""
+    logger.debug(f"Response Status: {response.status}")
+    logger.debug("----------------------")
+    return response
+
+
+# Test route to verify server is working
+@app.route('/test', methods=['GET'])
+def test():
+    logger.info("Test endpoint called")
+    return "Test endpoint working!"
 
 
 @app.route('/', methods=['GET', 'POST'])
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    logger.info("Webhook endpoint called")
+    logger.info(f"Request Method: {request.method}")
+
     if request.method == 'GET':
+        logger.info("GET request to webhook endpoint")
         return "Webhook server is running"
 
     try:
-        logger.info("Processing webhook request")
+        logger.info("Processing POST request to webhook")
+        logger.info(f"Headers: {dict(request.headers)}")
 
         # Validate request
         if not request.is_json:
-            logger.error("Received non-JSON payload")
+            logger.error("Non-JSON payload received")
             return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
 
         payload = request.json
@@ -173,28 +196,34 @@ def webhook():
         logger.info(f"Received webhook event: {event_type}")
         logger.debug(f"Webhook payload: {json.dumps(payload, indent=2)}")
 
-        # Format message
-        formatted_message = format_github_feed(event_type, payload)
-        logger.info("Message formatted successfully")
+        # Format and publish message
+        try:
+            formatted_message = format_github_feed(event_type, payload)
+            success = rabbitmq_service.publish_message(formatted_message)
 
-        # Publish message
-        success = rabbitmq_service.publish_message(formatted_message)
+            if success:
+                logger.info("Successfully published to RabbitMQ")
+                return jsonify({
+                    "status": "success",
+                    "message": f"Event {event_type} published to RabbitMQ"
+                }), 200
+            else:
+                logger.error("Failed to publish to RabbitMQ")
+                return jsonify({
+                    "status": "error",
+                    "message": "Failed to publish to RabbitMQ"
+                }), 500
 
-        if success:
-            logger.info(f"Successfully published {event_type} event to RabbitMQ")
-            return jsonify({
-                "status": "success",
-                "message": f"Event {event_type} published to RabbitMQ"
-            }), 200
-        else:
-            logger.error("Failed to publish message to RabbitMQ")
+        except Exception as inner_e:
+            logger.error(f"Error processing webhook data: {str(inner_e)}")
+            logger.error(traceback.format_exc())
             return jsonify({
                 "status": "error",
-                "message": "Failed to publish to RabbitMQ"
+                "message": "Error processing webhook data"
             }), 500
 
     except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}")
+        logger.error(f"Error in webhook endpoint: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({
             "status": "error",
@@ -218,4 +247,9 @@ if __name__ == '__main__':
     # Start server on port 8080 to match ngrok
     port = int(os.getenv('PORT', 8080))  # Changed default port to 8080
     logger.info(f"Starting webhook server on port {port}")
+
+    # Test the server's accessibility
+    logger.info(f"Server will be accessible at http://localhost:{port}")
+    logger.info("Make sure ngrok is pointing to this port")
+
     app.run(host='0.0.0.0', port=port, debug=True)
