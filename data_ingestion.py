@@ -5,15 +5,13 @@ import os
 from datetime import datetime, timezone
 import logging
 from dotenv import load_dotenv
-import traceback
-import sys
 
 # Load environment variables
 load_dotenv()
 
-# Set up logging with more detailed format
+# Set up logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG level
+    level=logging.DEBUG,  # Changed to DEBUG for more visibility
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.FileHandler('webhook.log'),
@@ -25,10 +23,8 @@ logger = logging.getLogger(__name__)
 
 def format_github_feed(event_type, payload):
     """Format GitHub webhook payload into a feed based on event type"""
-    logger.info(f"Formatting GitHub feed for event type: {event_type}")
-    logger.debug(f"Payload to format: {json.dumps(payload, indent=2)}")
+    logger.debug(f"Formatting GitHub feed for event type: {event_type}")
 
-    # Your existing format_github_feed code remains the same
     base_feed = {
         "event_type": event_type,
         "repository": {
@@ -41,13 +37,73 @@ def format_github_feed(event_type, payload):
             "username": payload.get('sender', {}).get('login'),
             "avatar_url": payload.get('sender', {}).get('avatar_url')
         },
-        "timestamp": datetime.now().isoformat()
+        "timestamp": None
     }
 
-    # Rest of your format_github_feed function...
+    if event_type == 'push':
+        commit = payload.get('head_commit', {})
+        base_feed.update({
+            "action": "pushed",
+            "branch": payload.get('ref', '').replace('refs/heads/', ''),
+            "commit": {
+                "id": commit.get('id', '')[:7],
+                "message": commit.get('message'),
+                "timestamp": commit.get('timestamp'),
+                "author": {
+                    "name": commit.get('author', {}).get('name'),
+                    "email": commit.get('author', {}).get('email')
+                },
+                "changes": {
+                    "added": commit.get('added', []),
+                    "modified": commit.get('modified', []),
+                    "removed": commit.get('removed', [])
+                }
+            },
+            "compare_url": payload.get('compare')
+        })
+        base_feed["timestamp"] = commit.get('timestamp')
 
-    logger.info("Successfully formatted GitHub feed")
-    logger.debug(f"Formatted message: {json.dumps(base_feed, indent=2)}")
+    elif event_type == 'pull_request':
+        pr = payload.get('pull_request', {})
+        base_feed.update({
+            "action": payload.get('action'),
+            "pull_request": {
+                "number": pr.get('number'),
+                "title": pr.get('title'),
+                "body": pr.get('body'),
+                "state": pr.get('state'),
+                "merged": pr.get('merged', False),
+                "base_branch": pr.get('base', {}).get('ref'),
+                "head_branch": pr.get('head', {}).get('ref'),
+                "author": {
+                    "username": pr.get('user', {}).get('login'),
+                    "avatar_url": pr.get('user', {}).get('avatar_url')
+                }
+            },
+            "html_url": pr.get('html_url')
+        })
+        base_feed["timestamp"] = pr.get('updated_at')
+
+    elif event_type == 'issues':
+        issue = payload.get('issue', {})
+        base_feed.update({
+            "action": payload.get('action'),
+            "issue": {
+                "number": issue.get('number'),
+                "title": issue.get('title'),
+                "body": issue.get('body'),
+                "state": issue.get('state'),
+                "author": {
+                    "username": issue.get('user', {}).get('login'),
+                    "avatar_url": issue.get('user', {}).get('avatar_url')
+                },
+                "labels": [label.get('name') for label in issue.get('labels', [])]
+            },
+            "html_url": issue.get('html_url')
+        })
+        base_feed["timestamp"] = issue.get('updated_at')
+
+    logger.debug(f"Formatted feed: {json.dumps(base_feed, indent=2)}")
     return base_feed
 
 
@@ -76,24 +132,28 @@ class RabbitMQService:
             logger.info("Successfully connected to RabbitMQ")
         except Exception as e:
             logger.error(f"Failed to connect to RabbitMQ: {str(e)}")
-            logger.error(traceback.format_exc())
             raise
+
+    def declare_queue(self, queue_name=None):
+        try:
+            queue_name = queue_name or self.queue_name
+            self.channel.queue_declare(queue=queue_name, durable=True)
+            logger.info(f"Queue declared: {queue_name}")
+        except Exception as e:
+            logger.error(f"Failed to declare queue: {str(e)}")
+            self._connect()
+            self.channel.queue_declare(queue=queue_name, durable=True)
 
     def publish_message(self, message, queue_name=None):
         try:
             queue_name = queue_name or self.queue_name
-            logger.info(f"Attempting to publish message to queue: {queue_name}")
+            logger.debug(f"Attempting to publish message to {queue_name}")
 
-            # Reconnect if needed
             if not self.connection or self.connection.is_closed:
                 logger.warning("Connection is closed. Reconnecting...")
                 self._connect()
 
-            # Prepare message
             message_body = json.dumps(message)
-            logger.debug(f"Prepared message body: {message_body[:200]}...")
-
-            # Publish message
             self.channel.basic_publish(
                 exchange='',
                 routing_key=queue_name,
@@ -104,36 +164,11 @@ class RabbitMQService:
                     timestamp=int(datetime.now(timezone.utc).timestamp())
                 )
             )
-
-            # Verify message was published
-            queue_info = self.channel.queue_declare(queue=queue_name, passive=True)
-            logger.info(f"Message published. Current queue size: {queue_info.method.message_count}")
+            logger.info(f"Message published to queue '{queue_name}'")
             return True
-
         except Exception as e:
             logger.error(f"Failed to publish message: {str(e)}")
-            logger.error(traceback.format_exc())
             return False
-
-    def declare_queue(self, queue_name=None):
-        try:
-            queue_name = queue_name or self.queue_name
-
-            try:
-                # Check if queue exists
-                self.channel.queue_declare(queue=queue_name, passive=True)
-                logger.info(f"Queue '{queue_name}' already exists")
-            except:
-                # Queue doesn't exist, create it
-                logger.info(f"Creating new queue '{queue_name}'")
-                self._connect()
-                result = self.channel.queue_declare(queue=queue_name, durable=True)
-                logger.info(f"Queue '{queue_name}' declared. Message count: {result.method.message_count}")
-
-        except Exception as e:
-            logger.error(f"Failed to declare queue: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
 
     def close(self):
         if self.connection and not self.connection.is_closed:
@@ -144,87 +179,64 @@ class RabbitMQService:
 app = Flask(__name__)
 
 
-# Add logging for ALL requests
+# Add request logging middleware
 @app.before_request
 def log_request_info():
-    """Log details about every request"""
     logger.debug("------- New Request -------")
     logger.debug(f"Request Method: {request.method}")
     logger.debug(f"Request URL: {request.url}")
-    logger.debug(f"Request Headers: {dict(request.headers)}")
+    logger.debug(f"Headers: {dict(request.headers)}")
     if request.data:
         logger.debug(f"Request Data: {request.get_data(as_text=True)}")
 
 
 @app.after_request
 def log_response_info(response):
-    """Log details about every response"""
     logger.debug(f"Response Status: {response.status}")
-    logger.debug("----------------------")
+    logger.debug("-------------------------")
     return response
 
 
-# Test route to verify server is working
 @app.route('/test', methods=['GET'])
 def test():
-    logger.info("Test endpoint called")
-    return "Test endpoint working!"
+    return "Webhook server is running!"
 
 
 @app.route('/', methods=['GET', 'POST'])
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logger.info("Webhook endpoint called")
-    logger.info(f"Request Method: {request.method}")
 
     if request.method == 'GET':
-        logger.info("GET request to webhook endpoint")
         return "Webhook server is running"
 
     try:
-        logger.info("Processing POST request to webhook")
-        logger.info(f"Headers: {dict(request.headers)}")
-
-        # Validate request
         if not request.is_json:
-            logger.error("Non-JSON payload received")
+            logger.error("Received non-JSON payload")
             return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
 
         payload = request.json
         event_type = request.headers.get('X-GitHub-Event', 'push')
 
         logger.info(f"Received webhook event: {event_type}")
-        logger.debug(f"Webhook payload: {json.dumps(payload, indent=2)}")
+        logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
 
-        # Format and publish message
-        try:
-            formatted_message = format_github_feed(event_type, payload)
-            success = rabbitmq_service.publish_message(formatted_message)
+        formatted_message = format_github_feed(event_type, payload)
+        success = rabbitmq_service.publish_message(formatted_message)
 
-            if success:
-                logger.info("Successfully published to RabbitMQ")
-                return jsonify({
-                    "status": "success",
-                    "message": f"Event {event_type} published to RabbitMQ"
-                }), 200
-            else:
-                logger.error("Failed to publish to RabbitMQ")
-                return jsonify({
-                    "status": "error",
-                    "message": "Failed to publish to RabbitMQ"
-                }), 500
-
-        except Exception as inner_e:
-            logger.error(f"Error processing webhook data: {str(inner_e)}")
-            logger.error(traceback.format_exc())
+        if success:
+            return jsonify({
+                "status": "success",
+                "message": f"Event {event_type} published to RabbitMQ"
+            }), 200
+        else:
             return jsonify({
                 "status": "error",
-                "message": "Error processing webhook data"
+                "message": "Failed to publish to RabbitMQ"
             }), 500
 
     except Exception as e:
-        logger.error(f"Error in webhook endpoint: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error processing webhook: {str(e)}")
         return jsonify({
             "status": "error",
             "message": str(e)
@@ -241,15 +253,11 @@ if __name__ == '__main__':
         queue_name=os.getenv('RABBITMQ_QUEUE', 'git_data_test')
     )
 
-    # Setup queue
+    # Declare the queue at startup
     rabbitmq_service.declare_queue()
 
-    # Start server on port 8080 to match ngrok
-    port = int(os.getenv('PORT', 8080))  # Changed default port to 8080
+    # Start the Flask app
+    port = int(os.getenv('PORT', 8080))
     logger.info(f"Starting webhook server on port {port}")
-
-    # Test the server's accessibility
     logger.info(f"Server will be accessible at http://localhost:{port}")
-    logger.info("Make sure ngrok is pointing to this port")
-
     app.run(host='0.0.0.0', port=port, debug=True)
