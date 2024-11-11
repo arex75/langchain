@@ -29,7 +29,7 @@ def test_queue():
         # Test message
         test_message = {
             "event_type": "test",
-            "payload": {"test": "message"},
+            "payload": {"test": "message1"},
             "timestamp": "2024-11-11T12:00:00Z"
         }
 
