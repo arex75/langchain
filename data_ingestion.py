@@ -162,49 +162,76 @@ class RabbitMQService:
     def declare_queue(self, queue_name=None):
         try:
             queue_name = queue_name or self.queue_name
-            result = self.channel.queue_declare(
-                queue=queue_name,
-                durable=True,
-                arguments={'x-message-ttl': 86400000}  # 24 hour message TTL
-            )
-            logger.info(f"Queue '{queue_name}' declared. Message count: {result.method.message_count}")
+
+            try:
+                # First try to check if queue exists
+                self.channel.queue_declare(queue=queue_name, passive=True)
+                logger.info(f"Queue '{queue_name}' already exists")
+            except (pika.exceptions.ChannelClosedByBroker, pika.exceptions.AMQPChannelError):
+                # If queue doesn't exist or there was an error, create it with our settings
+                logger.info(f"Creating new queue '{queue_name}'")
+                # Reconnect since the channel was closed
+                self._connect()
+                result = self.channel.queue_declare(
+                    queue=queue_name,
+                    durable=True,
+                    # Remove the TTL argument since it's causing issues
+                    # arguments={'x-message-ttl': 86400000}
+                )
+                logger.info(f"Queue '{queue_name}' declared. Message count: {result.method.message_count}")
+
         except Exception as e:
             logger.error(f"Failed to declare queue: {str(e)}")
             logger.error(traceback.format_exc())
-            self._connect()
-            self.channel.queue_declare(queue=queue_name, durable=True)
+            # Attempt to reconnect and declare without any special arguments
+            try:
+                self._connect()
+                self.channel.queue_declare(queue=queue_name, durable=True)
+                logger.info(f"Queue '{queue_name}' declared with basic settings")
+            except Exception as inner_e:
+                logger.error(f"Failed to declare queue with basic settings: {str(inner_e)}")
+                raise
 
     def publish_message(self, message, queue_name=None):
         try:
             queue_name = queue_name or self.queue_name
+            logger.debug(f"Publishing message to queue: {queue_name}")
 
             if not self.connection or self.connection.is_closed:
                 logger.warning("Connection is closed. Reconnecting...")
                 self._connect()
 
-            # Verify queue exists before publishing
-            self.channel.queue_declare(queue=queue_name, passive=True)
-
+            # Convert message to JSON string
             message_body = json.dumps(message)
-            logger.debug(f"Attempting to publish message: {message_body}")
+            logger.debug(f"Message body prepared: {message_body[:200]}...")  # Log first 200 chars
 
+            # Prepare message properties
+            properties = pika.BasicProperties(
+                delivery_mode=2,  # Makes the message persistent
+                content_type='application/json',
+                timestamp=int(datetime.now(timezone.utc).timestamp())
+            )
+            logger.debug("Message properties prepared")
+
+            # Publish the message
+            logger.debug("Attempting to publish message...")
             self.channel.basic_publish(
                 exchange='',
                 routing_key=queue_name,
                 body=message_body,
-                mandatory=True,  # Ensure message is routable
-                properties=pika.BasicProperties(
-                    delivery_mode=2,
-                    content_type='application/json',
-                    timestamp=int(datetime.now(timezone.utc).timestamp())
-                )
+                properties=properties
             )
             logger.info(f"Successfully published message to queue '{queue_name}'")
+
+            # Verify queue message count after publish
+            try:
+                queue_info = self.channel.queue_declare(queue=queue_name, passive=True)
+                logger.info(f"Current message count in queue '{queue_name}': {queue_info.method.message_count}")
+            except Exception as e:
+                logger.warning(f"Could not verify message count: {str(e)}")
+
             return True
 
-        except pika.exceptions.UnroutableError:
-            logger.error(f"Message was returned as unroutable for queue: {queue_name}")
-            return False
         except Exception as e:
             logger.error(f"Failed to publish message: {str(e)}")
             logger.error(traceback.format_exc())
@@ -250,31 +277,44 @@ rabbitmq_service.declare_queue()
 @app.route('/', methods=['GET', 'POST'])
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    logger.debug("Webhook endpoint called")
+    logger.debug("----------------------------------------")
+    logger.debug("New webhook request received")
     logger.debug(f"Request method: {request.method}")
+    logger.debug(f"Request headers: {dict(request.headers)}")
 
     if request.method == 'GET':
-        logger.debug("GET request received")
+        logger.debug("GET request received, returning status")
         return "Webhook server is running"
 
     try:
-        logger.debug("Processing POST request")
-        logger.debug(f"Content-Type: {request.content_type}")
+        # Log raw request data
+        logger.debug(f"Request content type: {request.content_type}")
+        logger.debug(f"Raw request data: {request.get_data(as_text=True)}")
 
         if not request.is_json:
-            logger.error("Received non-JSON payload")
+            logger.error("Request is not JSON")
             return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
 
         payload = request.json
         event_type = request.headers.get('X-GitHub-Event', 'push')
 
-        logger.info(f"Received webhook event: {event_type}")
+        logger.info(f"Processing webhook event: {event_type}")
         logger.debug(f"Full payload: {json.dumps(payload, indent=2)}")
 
-        # Format the message
+        # Validate payload
+        if not payload:
+            logger.error("Empty payload received")
+            return jsonify({"status": "error", "message": "Empty payload"}), 400
+
+        if not isinstance(payload, dict):
+            logger.error(f"Invalid payload type: {type(payload)}")
+            return jsonify({"status": "error", "message": "Invalid payload format"}), 400
+
         try:
+            logger.debug("Formatting GitHub feed")
             formatted_message = format_github_feed(event_type, payload)
-            logger.info(f"Formatted message: {json.dumps(formatted_message, indent=2)}")
+            logger.info("Successfully formatted GitHub feed")
+            logger.debug(f"Formatted message: {json.dumps(formatted_message, indent=2)}")
         except Exception as format_error:
             logger.error(f"Error formatting message: {str(format_error)}")
             logger.error(traceback.format_exc())
@@ -283,31 +323,58 @@ def webhook():
         # Publish with retry logic
         max_retries = 3
         for attempt in range(max_retries):
-            success = rabbitmq_service.publish_message(formatted_message)
-            if success:
-                logger.info(f"Successfully published message on attempt {attempt + 1}")
-                return jsonify({
-                    "status": "success",
-                    "message": f"Event {event_type} published to RabbitMQ",
-                    "attempt": attempt + 1
-                }), 200
-            else:
-                logger.warning(f"Failed to publish message, attempt {attempt + 1} of {max_retries}")
+            logger.debug(f"Attempting to publish message (attempt {attempt + 1}/{max_retries})")
+            try:
+                # Verify RabbitMQ connection before publishing
+                if not rabbitmq_service.connection or rabbitmq_service.connection.is_closed:
+                    logger.warning("RabbitMQ connection is closed, reconnecting...")
+                    rabbitmq_service._connect()
+
+                # Verify channel is open
+                if rabbitmq_service.channel.is_closed:
+                    logger.warning("RabbitMQ channel is closed, creating new channel")
+                    rabbitmq_service.channel = rabbitmq_service.connection.channel()
+
+                # Attempt to publish
+                success = rabbitmq_service.publish_message(formatted_message)
+
+                if success:
+                    logger.info(f"Successfully published message on attempt {attempt + 1}")
+                    response = {
+                        "status": "success",
+                        "message": f"Event {event_type} published to RabbitMQ",
+                        "attempt": attempt + 1
+                    }
+                    logger.debug(f"Sending response: {json.dumps(response, indent=2)}")
+                    return jsonify(response), 200
+                else:
+                    logger.warning(f"Failed to publish message, attempt {attempt + 1} of {max_retries}")
+                    if attempt < max_retries - 1:
+                        logger.debug("Waiting 1 second before retry")
+                        time.sleep(1)
+
+            except Exception as publish_error:
+                logger.error(f"Error during publish attempt {attempt + 1}: {str(publish_error)}")
+                logger.error(traceback.format_exc())
                 if attempt < max_retries - 1:
+                    logger.debug("Waiting 1 second before retry")
                     time.sleep(1)
 
+        logger.error("Failed to publish message after all retry attempts")
         return jsonify({
             "status": "error",
             "message": f"Failed to publish to RabbitMQ after {max_retries} attempts"
         }), 500
 
     except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}")
+        logger.error(f"Unexpected error in webhook handler: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({
             "status": "error",
             "message": str(e)
         }), 500
+    finally:
+        logger.debug("----------------------------------------")
 
 
 @app.teardown_appcontext
