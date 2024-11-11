@@ -8,3 +8,5 @@ python-dotenv
 aio-pika
 psycopg2-binary
 tiktoken
+pika~=1.3.2
+Flask~=3.0.3
