@@ -1,59 +1,23 @@
-import os
-from flask import Flask, request, jsonify
-import pika
-import hmac
-import hashlib
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
-import logging
+import pika
+import os
 from dotenv import load_dotenv
+import logging
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-
-# Configuration from environment variables
-GITHUB_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
+# RabbitMQ configuration
 RABBITMQ_USERNAME = os.getenv('RABBITMQ_USERNAME')
 RABBITMQ_PASSWORD = os.getenv('RABBITMQ_PASSWORD')
 RABBITMQ_HOST = os.getenv('RABBITMQ_HOST')
-RABBITMQ_PORT = os.getenv('RABBITMQ_PORT')
+RABBITMQ_PORT = int(os.getenv('RABBITMQ_PORT'))
 QUEUE_NAME = os.getenv('RABBITMQ_QUEUE', 'git_data_test')
-
-
-def setup_rabbitmq():
-    """Initialize RabbitMQ connection and create queue if it doesn't exist."""
-    try:
-        connection = get_rabbitmq_connection()
-        channel = connection.channel()
-
-        # Declare the queue - this creates it if it doesn't exist
-        channel.queue_declare(queue=QUEUE_NAME, durable=True)
-
-        connection.close()
-        logger.info(f"Successfully set up RabbitMQ queue: {QUEUE_NAME}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to set up RabbitMQ: {str(e)}")
-        return False
-
-
-def get_rabbitmq_connection():
-    """Create a connection to RabbitMQ using environment credentials."""
-    credentials = pika.PlainCredentials(RABBITMQ_USERNAME, RABBITMQ_PASSWORD)
-    parameters = pika.ConnectionParameters(
-        host=RABBITMQ_HOST,
-        port=int(RABBITMQ_PORT),
-        credentials=credentials,
-        virtual_host='/',
-        heartbeat=600,
-        blocked_connection_timeout=300
-    )
-    return pika.BlockingConnection(parameters)
 
 
 def format_github_feed(event_type, payload):
@@ -142,21 +106,6 @@ def format_github_feed(event_type, payload):
     return base_feed
 
 
-def verify_signature(payload_body, signature_header):
-    """Verify that the webhook is from GitHub using the secret token."""
-    if not signature_header:
-        logger.warning("No signature header present in request")
-        return False
-
-    sha_name, signature = signature_header.split('=')
-    if sha_name != 'sha256':
-        logger.warning(f"Unexpected hash algorithm: {sha_name}")
-        return False
-
-    mac = hmac.new(GITHUB_SECRET.encode(), msg=payload_body, digestmod=hashlib.sha256)
-    return hmac.compare_digest(mac.hexdigest(), signature)
-
-
 def publish_to_rabbitmq(event_type, payload):
     """Publish the formatted webhook payload to RabbitMQ."""
     try:
@@ -164,13 +113,23 @@ def publish_to_rabbitmq(event_type, payload):
         formatted_message = format_github_feed(event_type, payload)
 
         # Connect to RabbitMQ
-        connection = get_rabbitmq_connection()
+        credentials = pika.PlainCredentials(RABBITMQ_USERNAME, RABBITMQ_PASSWORD)
+        parameters = pika.ConnectionParameters(
+            host=RABBITMQ_HOST,
+            port=RABBITMQ_PORT,
+            credentials=credentials,
+            virtual_host='/',
+            heartbeat=600,
+            blocked_connection_timeout=300
+        )
+
+        connection = pika.BlockingConnection(parameters)
         channel = connection.channel()
 
-        # Declare the queue
+        # Declare queue
         channel.queue_declare(queue=QUEUE_NAME, durable=True)
 
-        # Publish formatted message
+        # Publish message
         channel.basic_publish(
             exchange='',
             routing_key=QUEUE_NAME,
@@ -189,105 +148,48 @@ def publish_to_rabbitmq(event_type, payload):
         return False
 
 
-@app.route('/webhook', methods=['POST', 'GET'])
-def webhook():
-    # Handle GET request (for testing)
-    if request.method == 'GET':
-        return jsonify({
-            'status': 'ok',
-            'message': 'Webhook endpoint is working. Please use POST method for GitHub webhooks.',
-            'supported_events': ['push', 'pull_request', 'issues']
-        }), 200
-
-    # Handle POST request (actual webhook)
-    # Verify signature
-    signature = request.headers.get('X-Hub-Signature-256')
-    if not verify_signature(request.data, signature):
-        logger.warning("Invalid webhook signature")
-        return jsonify({'error': 'Invalid signature'}), 401
-
-    # Get the event type
-    event_type = request.headers.get('X-GitHub-Event')
-    if not event_type:
-        logger.warning("No event type provided in webhook")
-        return jsonify({'error': 'No event type provided'}), 400
-
-    # Get payload
-    payload = request.json
-
-    logger.info(f"Received GitHub webhook event: {event_type}")
-    logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
-
-    # Publish to RabbitMQ
-    if publish_to_rabbitmq(event_type, payload):
-        return jsonify({
-            'status': 'success',
-            'message': f'Event {event_type} published to queue {QUEUE_NAME}'
-        }), 200
-    else:
-        return jsonify({'error': 'Failed to publish to queue'}), 500
-
-
-@app.route('/', methods=['GET'])
-def home():
-    """Home endpoint with basic information."""
-    return jsonify({
-        'status': 'running',
-        'endpoints': {
-            '/webhook': 'GitHub webhook endpoint (POST for webhooks, GET for testing)',
-            '/health': 'Health check endpoint',
-            '/': 'This information'
-        }
-    })
-
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint to verify the service is running."""
-    try:
-        # Test RabbitMQ connection
-        connection = get_rabbitmq_connection()
-        channel = connection.channel()
-
-        # Check if queue exists
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
         try:
-            channel.queue_declare(queue=QUEUE_NAME, passive=True)
-            queue_exists = True
-        except Exception:
-            queue_exists = False
+            # Get content length and read data
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
 
-        connection.close()
+            # Parse JSON payload
+            payload = json.loads(post_data.decode('utf-8'))
 
-        return jsonify({
-            'status': 'healthy',
-            'rabbitmq_connection': 'success',
-            'queue_exists': queue_exists,
-            'queue_name': QUEUE_NAME
-        }), 200
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return jsonify({
-            'status': 'unhealthy',
-            'rabbitmq_connection': 'failed',
-            'error': str(e)
-        }), 500
+            # Get event type from headers
+            event_type = self.headers.get('X-GitHub-Event')
+
+            # Log the received webhook
+            logger.info(f"Received webhook event: {event_type}")
+            logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+
+            # Publish to RabbitMQ
+            if publish_to_rabbitmq(event_type, payload):
+                logger.info("Successfully published to RabbitMQ")
+            else:
+                logger.error("Failed to publish to RabbitMQ")
+
+            # Send response
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        except Exception as e:
+            logger.error(f"Error processing webhook: {str(e)}")
+            self.send_response(500)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"Error processing webhook")
 
 
-if __name__ == '__main__':
-    # Verify all required environment variables are set
-    required_vars = [
-        'RABBITMQ_USERNAME', 'RABBITMQ_PASSWORD', 'RABBITMQ_HOST',
-        'RABBITMQ_PORT', 'GITHUB_WEBHOOK_SECRET'
-    ]
-
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    if missing_vars:
-        logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
-        exit(1)
-    # Setup RabbitMQ queue
-    if not setup_rabbitmq():
-        logger.error("Failed to set up RabbitMQ queue. Exiting.")
-        exit(1)
-
-    logger.info(f"Starting webhook server... Queue: {QUEUE_NAME}")
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    try:
+        server = HTTPServer(('localhost', 8080), WebhookHandler)
+        logger.info("Server running on port 8080")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down server...")
+        server.socket.close()
