@@ -7,7 +7,6 @@ import logging
 
 # Load environment variables
 load_dotenv()
-# testing :)) and testing :))
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
