@@ -4,6 +4,7 @@ import pika
 import os
 from dotenv import load_dotenv
 import logging
+# Testing Guys :)
 # Load environment variables
 load_dotenv()
 # Configure logging
